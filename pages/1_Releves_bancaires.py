@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import streamlit as st
 import pandas as pd
 
-from utils.pdf_extractor import extract_transactions
+from utils.pdf_extractor import extract_transactions, extract_solde_info, verifier_solde
 from utils.excel_generator import generate_excel, build_preview_dataframe
 
 
@@ -168,6 +168,12 @@ with st.expander("⚙️  Options comptables", expanded=False):
             value=False,
             help="Utile si le PDF est un scan ou si l'extraction standard donne de mauvais résultats.",
         )
+        force_image = st.checkbox(
+            "Forcer le mode image (OCR)",
+            value=False,
+            help="Convertit le PDF en image puis lit via OCR. Utile pour les PDF natifs "
+                 "'capricieux' où l'extraction normale échoue (équivalent à un 'imprimer en PDF').",
+        )
     with col_o4:
         nom_sortie = st.text_input(
             "Nom du fichier Excel",
@@ -182,11 +188,19 @@ uploaded_file = st.file_uploader(
     help="Glissez-déposez ou cliquez pour parcourir. Max 200 Mo.",
 )
 
-# ---------- Récupération de la clé API Gemini (depuis les secrets Streamlit) ----------
+# ---------- Récupération de la clé API Gemini ----------
+# Compatible Streamlit Cloud (st.secrets) ET Render/autres (variable d'environnement)
+import os
+
+gemini_api_key = None
+# 1. Essayer les secrets Streamlit (Streamlit Cloud)
 try:
     gemini_api_key = st.secrets.get("GEMINI_API_KEY", None)
-except (FileNotFoundError, Exception):
+except Exception:
     gemini_api_key = None
+# 2. Sinon, essayer la variable d'environnement (Render, Docker, etc.)
+if not gemini_api_key:
+    gemini_api_key = os.environ.get("GEMINI_API_KEY", None)
 
 # ---------- Traitement ----------
 if uploaded_file is not None:
@@ -205,11 +219,16 @@ if uploaded_file is not None:
                     pdf_bytes=pdf_bytes,
                     gemini_api_key=gemini_api_key,
                     force_ai=force_ai,
+                    force_image=force_image,
                 )
+                
+                # Extraire les infos de solde pour la vérification
+                solde_info = extract_solde_info(pdf_bytes)
                 
                 # Stocker dans la session pour réutilisation
                 st.session_state['transactions'] = transactions
                 st.session_state['metadata'] = metadata
+                st.session_state['solde_info'] = solde_info
                 st.session_state['compte_banque'] = compte_banque
                 st.session_state['compte_contrepartie'] = compte_contrepartie
                 st.session_state['nom_sortie'] = nom_sortie
@@ -243,6 +262,81 @@ if 'transactions' in st.session_state and st.session_state['transactions']:
             "Forcer l'utilisation de l'IA" dans les options ci-dessus.
         </div>
         """, unsafe_allow_html=True)
+    
+    # ----- Vérification du solde -----
+    st.markdown("##### 🔎 Vérification du solde")
+    st.caption("Vérifie que l'extraction est complète en recalculant le solde à partir des transactions.")
+    
+    if st.button("Calculer et vérifier le solde", key="verif_solde_btn"):
+        solde_info = st.session_state.get('solde_info', {})
+        verif = verifier_solde(transactions, solde_info)
+        st.session_state['verif_result'] = verif
+    
+    # Afficher le résultat de vérification s'il existe
+    if 'verif_result' in st.session_state:
+        verif = st.session_state['verif_result']
+        
+        # Totaux calculés (toujours affichés)
+        col_v1, col_v2, col_v3 = st.columns(3)
+        with col_v1:
+            st.metric("Total débits", f"{verif['total_debit_calcule']:,.2f} €".replace(',', ' '))
+        with col_v2:
+            st.metric("Total crédits", f"{verif['total_credit_calcule']:,.2f} €".replace(',', ' '))
+        with col_v3:
+            st.metric("Variation", f"{verif['variation_calculee']:,.2f} €".replace(',', ' '))
+        
+        # Comparaison avec les totaux du relevé (si détectés)
+        lignes_compare = []
+        if 'ecart_debit' in verif:
+            ok = abs(verif['ecart_debit']) < 0.01
+            icone = "✅" if ok else "⚠️"
+            lignes_compare.append(
+                f"{icone} **Total débits relevé** : {verif['total_debit_releve']:,.2f} € "
+                f"— écart : {verif['ecart_debit']:+,.2f} €".replace(',', ' ')
+            )
+        if 'ecart_credit' in verif:
+            ok = abs(verif['ecart_credit']) < 0.01
+            icone = "✅" if ok else "⚠️"
+            lignes_compare.append(
+                f"{icone} **Total crédits relevé** : {verif['total_credit_releve']:,.2f} € "
+                f"— écart : {verif['ecart_credit']:+,.2f} €".replace(',', ' ')
+            )
+        
+        if lignes_compare:
+            st.markdown("**Comparaison avec les totaux imprimés sur le relevé :**")
+            for ligne in lignes_compare:
+                st.markdown(ligne)
+        
+        # Vérification ancien solde + variation = nouveau solde
+        if 'solde_ok' in verif:
+            if verif['solde_ok']:
+                st.markdown(f"""
+                <div class="success-box">
+                    ✅ <strong>Solde vérifié et cohérent !</strong><br>
+                    Ancien solde ({verif['ancien_solde']:,.2f} €) + variation ({verif['variation_calculee']:,.2f} €) 
+                    = nouveau solde ({verif['nouveau_solde_calcule']:,.2f} €), 
+                    conforme au relevé. L'extraction est complète.
+                </div>
+                """.replace(',', ' '), unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="warning-box">
+                    ⚠️ <strong>Écart de solde détecté : {verif['ecart_solde']:+,.2f} €</strong><br>
+                    Nouveau solde calculé : {verif['nouveau_solde_calcule']:,.2f} € &nbsp;·&nbsp;
+                    Nouveau solde du relevé : {verif['nouveau_solde_releve']:,.2f} €<br>
+                    Il manque peut-être des transactions, ou certaines sont mal extraites. 
+                    Essayez le mode image (OCR) ou l'IA dans les options.
+                </div>
+                """.replace(',', ' '), unsafe_allow_html=True)
+        elif not lignes_compare:
+            # Aucune info de solde détectée sur le relevé
+            st.info(
+                "ℹ️ Impossible de trouver l'ancien/nouveau solde ou les totaux sur ce relevé "
+                "pour une vérification automatique. Les totaux calculés ci-dessus restent "
+                "disponibles pour une vérification manuelle."
+            )
+    
+    st.markdown("---")
     
     # ----- Onglets : Aperçu transactions / Aperçu Excel -----
     tab1, tab2 = st.tabs(["📋 Transactions extraites", "📊 Aperçu du fichier Excel"])

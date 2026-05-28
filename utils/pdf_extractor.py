@@ -27,6 +27,20 @@ AMOUNT_RE = re.compile(r'^-?\d{1,3}(?:[\s.]\d{3})*,\d{2}$')
 # Détection année dans la date d'arrêté
 YEAR_RE = re.compile(r"[Dd]ate\s+d['']arr[êe]t[ée]\s*:\s*\d{1,2}\s+\w+\s+(\d{4})")
 
+# Détection des soldes et totaux (pour la vérification)
+ANCIEN_SOLDE_RE = re.compile(
+    r"[Aa]ncien\s+solde\s+(créditeur|débiteur|crediteur|debiteur)\b.*?(\d{1,3}(?:[\s.]\d{3})*,\d{2})",
+    re.IGNORECASE
+)
+NOUVEAU_SOLDE_RE = re.compile(
+    r"[Nn]ouveau\s+solde\s+(créditeur|débiteur|crediteur|debiteur)\b.*?(\d{1,3}(?:[\s.]\d{3})*,\d{2})",
+    re.IGNORECASE
+)
+TOTAL_OPE_RE = re.compile(
+    r"[Tt]otal\s+des\s+op[ée]rations\s+(\d{1,3}(?:[\s.]\d{3})*,\d{2})\s+(\d{1,3}(?:[\s.]\d{3})*,\d{2})",
+    re.IGNORECASE
+)
+
 # Détection banque
 BANQUE_PATTERNS = {
     'Crédit Agricole': ['credit agricole', 'crédit agricole'],
@@ -151,130 +165,154 @@ def extract_with_positions(pdf_bytes: bytes) -> Tuple[List[Dict], Dict]:
             words = page.extract_words()
             if not words:
                 continue
-            
-            # Repérer les positions X des colonnes Débit et Crédit
-            debit_x, credit_x = None, None
-            for w in words:
-                txt = w['text']
-                if txt == 'Débit' and debit_x is None:
-                    debit_x = (w['x0'] + w['x1']) / 2
-                elif txt == 'Crédit' and credit_x is None and w['x0'] > 350:
-                    # On exclut le mot "Crédit" qui pourrait apparaître dans "Crédit Agricole"
-                    credit_x = (w['x0'] + w['x1']) / 2
-            
-            # Si on ne trouve pas les colonnes, fallback : largeur page / 2
-            if not debit_x or not credit_x:
-                page_width = page.width
-                debit_x = page_width * 0.6
-                credit_x = page_width * 0.75
-            
-            # Grouper les mots par ligne (même Y, tolérance 3px)
-            lines_by_y = {}
-            for w in words:
-                y = round(w['top'])
-                key = None
-                for existing_y in lines_by_y:
-                    if abs(existing_y - y) <= 3:
-                        key = existing_y
-                        break
-                if key is None:
-                    key = y
-                lines_by_y.setdefault(key, []).append(w)
-            
-            # Trier les lignes par Y croissant
-            sorted_lines = sorted(lines_by_y.items())
-            
-            # Parcourir les lignes
-            current_tx = None
-            for y, words_in_line in sorted_lines:
-                words_in_line.sort(key=lambda w: w['x0'])
-                texts = [w['text'] for w in words_in_line]
-                line_text = ' '.join(texts)
-                
-                # Ignorer les lignes parasites
-                if is_ignorable_line(line_text):
-                    if current_tx:
-                        transactions.append(current_tx)
-                        current_tx = None
-                    continue
-                
-                # Détecter le pattern : ligne contient 2 dates JJ.MM JJ.MM consécutives
-                # (parfois précédées d'un numéro de page parasite comme "39498")
-                date_idx = _find_date_pair_index(texts)
-                
-                if date_idx is not None:
-                    m1 = DATE_SHORT_RE.match(texts[date_idx])
-                    m2 = DATE_SHORT_RE.match(texts[date_idx + 1])
-                    
-                    if m1 and m2:
-                        # Nouvelle transaction : sauvegarder la précédente
-                        if current_tx:
-                            transactions.append(current_tx)
-                        
-                        day, month = m1.groups()
-                        date_str = f"{day}/{month}/{year}"
-                        
-                        # Extraire le ou les montants de la ligne (et reconstituer ceux à espaces)
-                        amounts_in_line = _extract_amounts_from_words(words_in_line)
-                        
-                        debit, credit = None, None
-                        libelle = ""
-                        
-                        if amounts_in_line:
-                            # Dernier montant trouvé = montant de la transaction
-                            amt_text, amt_x, amt_word_indices = amounts_in_line[-1]
-                            
-                            # Comparer position à débit_x vs credit_x
-                            if abs(amt_x - debit_x) < abs(amt_x - credit_x):
-                                debit = amt_text
-                            else:
-                                credit = amt_text
-                            
-                            # Libellé = mots après les 2 dates, sauf ceux du montant
-                            lib_words = []
-                            for idx in range(date_idx + 2, len(words_in_line)):
-                                w = words_in_line[idx]
-                                if idx not in amt_word_indices and not AMOUNT_RE.match(w['text']):
-                                    lib_words.append(w['text'])
-                            libelle = clean_libelle(' '.join(lib_words))
-                        else:
-                            libelle = clean_libelle(' '.join(texts[date_idx + 2:]))
-                        
-                        current_tx = {
-                            'date': date_str,
-                            'libelle': libelle,
-                            'debit': parse_amount(debit) if debit else None,
-                            'credit': parse_amount(credit) if credit else None,
-                        }
-                        continue
-                
-                # Ligne sans date : suite du libellé OU montant orphelin
-                if current_tx:
-                    amounts_in_line = _extract_amounts_from_words(words_in_line)
-                    
-                    # Si la transaction courante n'a pas de montant et qu'on en trouve un
-                    if current_tx['debit'] is None and current_tx['credit'] is None and amounts_in_line:
-                        amt_text, amt_x, _ = amounts_in_line[-1]
-                        if abs(amt_x - debit_x) < abs(amt_x - credit_x):
-                            current_tx['debit'] = parse_amount(amt_text)
-                        else:
-                            current_tx['credit'] = parse_amount(amt_text)
-                    else:
-                        # Suite du libellé (limité à 120 chars pour éviter les abus)
-                        extra_words = [w['text'] for w in words_in_line if not AMOUNT_RE.match(w['text'])]
-                        extra = clean_libelle(' '.join(extra_words))
-                        if extra and len(current_tx['libelle']) + len(extra) < 120:
-                            current_tx['libelle'] = clean_libelle(current_tx['libelle'] + ' ' + extra)
-            
-            # Sauvegarder la dernière transaction de la page
+
+            page_width = page.width
+            page_tx = _parse_positioned_words(words, year, page_width=page_width)
+            transactions.extend(page_tx)
+
+    # Filtrer les transactions sans montant
+    transactions = [t for t in transactions if t.get('debit') or t.get('credit')]
+
+    return transactions, metadata
+
+
+def _parse_positioned_words(
+    words: List[Dict],
+    year: str,
+    page_width: Optional[float] = None,
+) -> List[Dict]:
+    """
+    Cœur de l'algorithme d'extraction par positions spatiales.
+    Prend une liste de mots positionnés ({'text','x0','x1','top'}) et retourne
+    les transactions de cette page.
+
+    Utilisé à la fois par :
+    - extract_with_positions (mots venant de pdfplumber)
+    - extract_with_ocr (mots venant de Tesseract image_to_data)
+    """
+    transactions = []
+
+    # Repérer les positions X des colonnes Débit et Crédit
+    debit_x, credit_x = None, None
+    for w in words:
+        txt = w['text']
+        if txt == 'Débit' and debit_x is None:
+            debit_x = (w['x0'] + w['x1']) / 2
+        elif txt == 'Crédit' and credit_x is None and w['x0'] > 350:
+            # On exclut le mot "Crédit" qui pourrait apparaître dans "Crédit Agricole"
+            credit_x = (w['x0'] + w['x1']) / 2
+
+    # Si on ne trouve pas les colonnes, fallback basé sur la largeur de page
+    if not debit_x or not credit_x:
+        if not page_width:
+            # Estimer la largeur depuis le mot le plus à droite
+            page_width = max((w['x1'] for w in words), default=600)
+        debit_x = page_width * 0.6
+        credit_x = page_width * 0.75
+
+    # Grouper les mots par ligne (même Y, tolérance 3px)
+    lines_by_y = {}
+    for w in words:
+        y = round(w['top'])
+        key = None
+        for existing_y in lines_by_y:
+            if abs(existing_y - y) <= 3:
+                key = existing_y
+                break
+        if key is None:
+            key = y
+        lines_by_y.setdefault(key, []).append(w)
+
+    # Trier les lignes par Y croissant
+    sorted_lines = sorted(lines_by_y.items())
+
+    # Parcourir les lignes
+    current_tx = None
+    for y, words_in_line in sorted_lines:
+        words_in_line.sort(key=lambda w: w['x0'])
+        texts = [w['text'] for w in words_in_line]
+        line_text = ' '.join(texts)
+
+        # Ignorer les lignes parasites
+        if is_ignorable_line(line_text):
             if current_tx:
                 transactions.append(current_tx)
                 current_tx = None
-    
-    # Filtrer les transactions sans montant
-    transactions = [t for t in transactions if t.get('debit') or t.get('credit')]
-    
-    return transactions, metadata
+            continue
+
+        # Détecter le pattern : ligne contient 2 dates JJ.MM JJ.MM consécutives
+        # (parfois précédées d'un numéro de page parasite comme "39498")
+        date_idx = _find_date_pair_index(texts)
+
+        if date_idx is not None:
+            m1 = DATE_SHORT_RE.match(texts[date_idx])
+            m2 = DATE_SHORT_RE.match(texts[date_idx + 1])
+
+            if m1 and m2:
+                # Nouvelle transaction : sauvegarder la précédente
+                if current_tx:
+                    transactions.append(current_tx)
+
+                day, month = m1.groups()
+                date_str = f"{day}/{month}/{year}"
+
+                # Extraire le ou les montants de la ligne (et reconstituer ceux à espaces)
+                amounts_in_line = _extract_amounts_from_words(words_in_line)
+
+                debit, credit = None, None
+                libelle = ""
+
+                if amounts_in_line:
+                    # Dernier montant trouvé = montant de la transaction
+                    amt_text, amt_x, amt_word_indices = amounts_in_line[-1]
+
+                    # Comparer position à débit_x vs credit_x
+                    if abs(amt_x - debit_x) < abs(amt_x - credit_x):
+                        debit = amt_text
+                    else:
+                        credit = amt_text
+
+                    # Libellé = mots après les 2 dates, sauf ceux du montant
+                    lib_words = []
+                    for idx in range(date_idx + 2, len(words_in_line)):
+                        w = words_in_line[idx]
+                        if idx not in amt_word_indices and not AMOUNT_RE.match(w['text']):
+                            lib_words.append(w['text'])
+                    libelle = clean_libelle(' '.join(lib_words))
+                else:
+                    libelle = clean_libelle(' '.join(texts[date_idx + 2:]))
+
+                current_tx = {
+                    'date': date_str,
+                    'libelle': libelle,
+                    'debit': parse_amount(debit) if debit else None,
+                    'credit': parse_amount(credit) if credit else None,
+                }
+                continue
+
+        # Ligne sans date : suite du libellé OU montant orphelin
+        if current_tx:
+            amounts_in_line = _extract_amounts_from_words(words_in_line)
+
+            # Si la transaction courante n'a pas de montant et qu'on en trouve un
+            if current_tx['debit'] is None and current_tx['credit'] is None and amounts_in_line:
+                amt_text, amt_x, _ = amounts_in_line[-1]
+                if abs(amt_x - debit_x) < abs(amt_x - credit_x):
+                    current_tx['debit'] = parse_amount(amt_text)
+                else:
+                    current_tx['credit'] = parse_amount(amt_text)
+            else:
+                # Suite du libellé (limité à 120 chars pour éviter les abus)
+                extra_words = [w['text'] for w in words_in_line if not AMOUNT_RE.match(w['text'])]
+                extra = clean_libelle(' '.join(extra_words))
+                if extra and len(current_tx['libelle']) + len(extra) < 120:
+                    current_tx['libelle'] = clean_libelle(current_tx['libelle'] + ' ' + extra)
+
+    # Sauvegarder la dernière transaction de la page
+    if current_tx:
+        transactions.append(current_tx)
+
+    return transactions
 
 
 def _find_date_pair_index(texts: List[str]) -> Optional[int]:
@@ -330,50 +368,105 @@ def _extract_amounts_from_words(words_in_line: List[Dict]) -> List[Tuple[str, fl
     return amounts
 
 
-# ---------- Méthode 2 : OCR pour les PDFs scannés ----------
-def extract_with_ocr(pdf_bytes: bytes) -> Tuple[List[Dict], Dict]:
+# ---------- Méthode 2 : OCR pour les PDFs scannés ou aplatis en image ----------
+def extract_with_ocr(pdf_bytes: bytes, dpi: int = 300) -> Tuple[List[Dict], Dict]:
     """
-    OCR du PDF avec pytesseract puis extraction texte.
-    Fonctionne pour les relevés scannés.
+    OCR du PDF avec pytesseract.
+    Utilise image_to_data pour récupérer les POSITIONS des mots,
+    ce qui permet de réutiliser le même algorithme de tri débit/crédit
+    que l'extraction native (méthode fiable).
+
+    Fonctionne pour :
+    - les relevés scannés
+    - le mode "force image" (PDF natif aplati en image avant OCR)
     """
     metadata = {
-        'method': 'OCR (pytesseract)',
+        'method': 'OCR (pytesseract + positions)',
         'pages_processed': 0,
         'is_scanned': True,
         'banque_detectee': None,
     }
-    
+
     try:
         from pdf2image import convert_from_bytes
         import pytesseract
     except ImportError as e:
         metadata['error'] = f"Modules OCR non installés : {e}"
         return [], metadata
-    
-    # Convertir le PDF en images
+
+    # Convertir le PDF en images (dpi élevé = meilleure reconnaissance)
     try:
-        images = convert_from_bytes(pdf_bytes, dpi=200)
+        images = convert_from_bytes(pdf_bytes, dpi=dpi)
     except Exception as e:
         metadata['error'] = f"Conversion PDF→image échouée : {e}"
         return [], metadata
-    
+
     metadata['pages_processed'] = len(images)
-    all_text = ""
-    
+
+    # 1er passage : récupérer tout le texte pour détecter année + banque
+    full_text_parts = []
+    pages_words = []  # liste de listes de mots positionnés (un par page)
+
     for img in images:
-        # OCR en français
-        text = pytesseract.image_to_string(img, lang='fra')
-        all_text += text + "\n"
-    
-    # Détection année + banque
+        # image_to_data renvoie un dict avec text, left, top, width, height, conf
+        data = pytesseract.image_to_data(
+            img, lang='fra', output_type=pytesseract.Output.DICT
+        )
+        words = _ocr_data_to_words(data)
+        pages_words.append(words)
+        full_text_parts.append(' '.join(w['text'] for w in words))
+
+    all_text = '\n'.join(full_text_parts)
     year = detect_year_from_text(all_text)
     metadata['banque_detectee'] = detect_banque(all_text)
     metadata['year_detected'] = year
-    
-    # Parser le texte ligne par ligne
-    transactions = _parse_text_lines(all_text, year)
-    
+
+    # 2e passage : parser chaque page avec l'algo par positions
+    transactions = []
+    for words in pages_words:
+        page_tx = _parse_positioned_words(words, year)
+        transactions.extend(page_tx)
+
+    # Filtrer les transactions sans montant
+    transactions = [t for t in transactions if t.get('debit') or t.get('credit')]
+
+    # Si l'algo par positions n'a rien donné, fallback sur le parsing texte simple
+    if not transactions:
+        metadata['method'] = 'OCR (pytesseract + texte)'
+        transactions = _parse_text_lines(all_text, year)
+
     return transactions, metadata
+
+
+def _ocr_data_to_words(data: dict) -> List[Dict]:
+    """
+    Convertit la sortie de pytesseract.image_to_data en liste de mots
+    au même format que pdfplumber : {'text', 'x0', 'x1', 'top'}.
+    Ne garde que les mots avec une confiance suffisante.
+    """
+    words = []
+    n = len(data['text'])
+    for i in range(n):
+        txt = data['text'][i].strip()
+        if not txt:
+            continue
+        try:
+            conf = float(data['conf'][i])
+        except (ValueError, TypeError):
+            conf = -1
+        # Ignorer les mots de très faible confiance (bruit OCR)
+        if conf < 30:
+            continue
+        left = data['left'][i]
+        top = data['top'][i]
+        width = data['width'][i]
+        words.append({
+            'text': txt,
+            'x0': float(left),
+            'x1': float(left + width),
+            'top': float(top),
+        })
+    return words
 
 
 def _parse_text_lines(text: str, year: str) -> List[Dict]:
@@ -525,27 +618,139 @@ RÈGLES STRICTES :
     raise RuntimeError(f"Aucun modèle Gemini disponible. Dernière erreur : {last_error}")
 
 
+# ---------- Extraction des soldes (pour vérification) ----------
+def extract_solde_info(pdf_bytes: bytes) -> Dict:
+    """
+    Extrait les informations de solde du relevé pour permettre la vérification :
+    - ancien solde (avec son sens : créditeur/débiteur)
+    - nouveau solde (avec son sens)
+    - total des opérations (débit / crédit) si présent
+
+    Retourne un dict avec les clés trouvées (valeurs en float), ou {} si rien.
+    """
+    info = {}
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            all_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+    except Exception:
+        return info
+
+    # Ancien solde
+    m = ANCIEN_SOLDE_RE.search(all_text)
+    if m:
+        sens = (m.group(1) or '').lower()
+        val = parse_amount(m.group(2))
+        info['ancien_solde'] = val
+        is_cred = sens.startswith('cr')
+        is_deb = sens.startswith('d')
+        info['ancien_solde_sens'] = 'crediteur' if is_cred else ('debiteur' if is_deb else None)
+
+    # Nouveau solde
+    m = NOUVEAU_SOLDE_RE.search(all_text)
+    if m:
+        sens = (m.group(1) or '').lower()
+        val = parse_amount(m.group(2))
+        info['nouveau_solde'] = val
+        is_cred = sens.startswith('cr')
+        is_deb = sens.startswith('d')
+        info['nouveau_solde_sens'] = 'crediteur' if is_cred else ('debiteur' if is_deb else None)
+
+    # Total des opérations (débit, crédit)
+    m = TOTAL_OPE_RE.search(all_text)
+    if m:
+        info['total_debit_releve'] = parse_amount(m.group(1))
+        info['total_credit_releve'] = parse_amount(m.group(2))
+
+    return info
+
+
+def verifier_solde(transactions: List[Dict], solde_info: Dict) -> Dict:
+    """
+    Calcule la vérification du solde à partir des transactions extraites
+    et des informations de solde du relevé.
+
+    Convention : sur un relevé bancaire vu côté client,
+    - un CRÉDIT augmente le solde (entrée d'argent)
+    - un DÉBIT diminue le solde (sortie d'argent)
+
+    Retourne un dict avec les totaux calculés et le résultat de la vérification.
+    """
+    total_credit = sum(t['credit'] or 0 for t in transactions)
+    total_debit = sum(t['debit'] or 0 for t in transactions)
+
+    resultat = {
+        'nb_transactions': len(transactions),
+        'total_credit_calcule': total_credit,
+        'total_debit_calcule': total_debit,
+        'variation_calculee': total_credit - total_debit,
+    }
+
+    # Comparaison avec les totaux du relevé (si présents)
+    if 'total_debit_releve' in solde_info:
+        resultat['total_debit_releve'] = solde_info['total_debit_releve']
+        resultat['ecart_debit'] = round(total_debit - solde_info['total_debit_releve'], 2)
+    if 'total_credit_releve' in solde_info:
+        resultat['total_credit_releve'] = solde_info['total_credit_releve']
+        resultat['ecart_credit'] = round(total_credit - solde_info['total_credit_releve'], 2)
+
+    # Vérification via ancien + variation = nouveau solde
+    if 'ancien_solde' in solde_info and 'nouveau_solde' in solde_info:
+        ancien = solde_info['ancien_solde']
+        nouveau = solde_info['nouveau_solde']
+        sens_ancien = solde_info.get('ancien_solde_sens')
+        sens_nouveau = solde_info.get('nouveau_solde_sens')
+
+        # Convertir en valeur signée : créditeur = positif, débiteur = négatif
+        ancien_signe = ancien if sens_ancien != 'debiteur' else -ancien
+        nouveau_signe = nouveau if sens_nouveau != 'debiteur' else -nouveau
+
+        nouveau_attendu = ancien_signe + (total_credit - total_debit)
+
+        resultat['ancien_solde'] = ancien_signe
+        resultat['nouveau_solde_releve'] = nouveau_signe
+        resultat['nouveau_solde_calcule'] = round(nouveau_attendu, 2)
+        resultat['ecart_solde'] = round(nouveau_attendu - nouveau_signe, 2)
+        resultat['solde_ok'] = abs(resultat['ecart_solde']) < 0.01
+
+    return resultat
+
+
 # ---------- Fonction principale ----------
 def extract_transactions(
     pdf_bytes: bytes,
     gemini_api_key: Optional[str] = None,
     force_ai: bool = False,
+    force_image: bool = False,
 ) -> Tuple[List[Dict], Dict]:
     """
     Extraction en cascade :
     1. Si force_ai → directement Gemini
-    2. Sinon : pdfplumber (positions spatiales)
-    3. Si PDF scanné → OCR
-    4. Si toujours rien → Gemini (si clé fournie)
+    2. Si force_image → conversion en image + OCR (utile pour PDF natifs "capricieux")
+    3. Sinon : pdfplumber (positions spatiales)
+    4. Si PDF scanné → OCR automatique
+    5. Si toujours rien → Gemini (si clé fournie)
     """
     if force_ai:
         if not gemini_api_key:
             raise RuntimeError("Aucune clé Gemini fournie. Impossible de forcer l'IA.")
         return extract_with_gemini(pdf_bytes, gemini_api_key)
-    
+
+    # Mode "force image" : on aplatit le PDF en image et on passe par l'OCR,
+    # même si le PDF est natif (contourne les structures internes capricieuses)
+    if force_image:
+        ocr_transactions, ocr_metadata = extract_with_ocr(pdf_bytes)
+        ocr_metadata['method'] = ocr_metadata.get('method', 'OCR') + ' [mode image forcé]'
+        # Si l'OCR forcé échoue et qu'on a une clé, tenter Gemini
+        if not ocr_transactions and gemini_api_key:
+            try:
+                return extract_with_gemini(pdf_bytes, gemini_api_key)
+            except Exception as e:
+                ocr_metadata['ai_error'] = str(e)
+        return ocr_transactions, ocr_metadata
+
     # Étape 1 : pdfplumber par positions
     transactions, metadata = extract_with_positions(pdf_bytes)
-    
+
     # Étape 2 : Si scanné, basculer en OCR
     if metadata.get('is_scanned'):
         ocr_transactions, ocr_metadata = extract_with_ocr(pdf_bytes)
@@ -559,7 +764,7 @@ def extract_transactions(
                 ocr_metadata['ai_error'] = str(e)
                 return [], ocr_metadata
         return [], ocr_metadata
-    
+
     # Étape 3 : Si extraction Python a donné peu de résultats → fallback Gemini
     if len(transactions) < 3 and gemini_api_key:
         try:
@@ -569,5 +774,5 @@ def extract_transactions(
                 return ai_transactions, ai_metadata
         except Exception as e:
             metadata['ai_error'] = str(e)
-    
+
     return transactions, metadata
