@@ -113,10 +113,21 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------- Fil d'Ariane ----------
-col_back, _ = st.columns([1, 8])
+col_back, col_reset, _ = st.columns([1, 1, 6])
 with col_back:
     if st.button("← Accueil", key="back_home"):
         st.switch_page("app.py")
+with col_reset:
+    if st.button("🔄 Réinitialiser", key="reset_module_2"):
+        # Effacer toutes les clés de session liées au module 2
+        keys_to_clear = [
+            'electrip_excel', 'electrip_brutes', 'electrip_ecritures',
+            'electrip_nb_source', 'electrip_nom_sortie',
+        ]
+        for k in keys_to_clear:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
 
 st.markdown("""
 <p class="breadcrumb">

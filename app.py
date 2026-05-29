@@ -28,22 +28,30 @@ st.markdown("""
         max-width: 1100px;
     }
     
-    /* Cartes modules */
+    /* ----- Cartes modules ----- */
     .module-card {
+        display: block;
         background: white;
         border: 1px solid #E8E2DC;
         border-radius: 12px;
         padding: 1.5rem;
         height: 100%;
+        min-height: 170px;
         transition: all 0.2s ease;
+        text-decoration: none !important;
+        color: inherit !important;
     }
-    .module-card-available:hover {
+    /* Carte disponible : devient cliquable, effet hover */
+    a.module-card:hover {
         border-color: #D85A30;
         box-shadow: 0 4px 12px rgba(216, 90, 48, 0.08);
         transform: translateY(-2px);
+        text-decoration: none !important;
     }
+    /* Carte désactivée : opacité réduite, pas d'effet */
     .module-card-disabled {
         opacity: 0.55;
+        cursor: not-allowed;
     }
     
     .module-icon {
@@ -147,32 +155,26 @@ col1, col2, col3 = st.columns(3)
 # ----- Module 1 : Relevés bancaires (DISPONIBLE) -----
 with col1:
     st.markdown("""
-    <div class="module-card module-card-available">
+    <a href="/Releves_bancaires" target="_self" class="module-card">
         <div class="module-icon icon-bank">📄</div>
         <span class="module-badge badge-available">DISPONIBLE</span>
         <p class="module-title">Relevés bancaires</p>
         <p class="module-description">PDF → Excel comptable avec contreparties 471 / 512. Multi-banques, scan ou PDF natif.</p>
-    </div>
+    </a>
     """, unsafe_allow_html=True)
-    st.write("")
-    if st.button("Ouvrir le module", key="btn_module_1"):
-        st.switch_page("pages/1_Releves_bancaires.py")
 
 # ----- Module 2 : Banque Electrip (DISPONIBLE) -----
 with col2:
     st.markdown("""
-    <div class="module-card module-card-available">
+    <a href="/Banque_Electrip" target="_self" class="module-card">
         <div class="module-icon icon-bank">💳</div>
         <span class="module-badge badge-available">DISPONIBLE</span>
         <p class="module-title">Banque Electrip</p>
         <p class="module-description">CSV Electrip → Excel comptable avec contreparties 471 / 512 et marquage automatique.</p>
-    </div>
+    </a>
     """, unsafe_allow_html=True)
-    st.write("")
-    if st.button("Ouvrir le module", key="btn_module_2"):
-        st.switch_page("pages/2_Banque_Electrip.py")
 
-# ----- Module 3 : Placeholder -----
+# ----- Module 3 : Placeholder (non cliquable) -----
 with col3:
     st.markdown("""
     <div class="module-card module-card-disabled">
@@ -182,8 +184,6 @@ with col3:
         <p class="module-description">Emplacement réservé pour le prochain outil d'automatisation.</p>
     </div>
     """, unsafe_allow_html=True)
-    st.write("")
-    st.button("Bientôt disponible", key="btn_module_3", disabled=True)
 
 # ---------- Footer info ----------
 st.markdown("""

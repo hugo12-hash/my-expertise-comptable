@@ -530,15 +530,26 @@ def _parse_text_lines(text: str, year: str) -> List[Dict]:
 
 
 # ---------- Méthode 3 : Gemini API ----------
-def extract_with_gemini(pdf_bytes: bytes, api_key: str) -> Tuple[List[Dict], Dict]:
+def extract_with_gemini(
+    pdf_bytes: bytes,
+    api_key: str,
+    as_images: bool = False,
+) -> Tuple[List[Dict], Dict]:
     """
-    Fallback ultime : utilisation de Gemini pour extraire les transactions.
+    Utilisation de Gemini pour extraire les transactions.
     Utilise le modèle Gemini 2.0 Flash (actuel).
+
+    Args:
+        pdf_bytes: contenu binaire du PDF.
+        api_key: clé API Gemini.
+        as_images: si True, le PDF est d'abord converti en images puis envoyé à
+                   l'IA en tant qu'images (utile pour PDF natifs "capricieux"
+                   dont la structure interne perturbe même l'IA).
     """
     import google.generativeai as genai
-    
+
     genai.configure(api_key=api_key)
-    
+
     # Liste des modèles à essayer (du plus récent au plus stable)
     MODELS_TO_TRY = [
         'gemini-2.0-flash',
@@ -546,9 +557,9 @@ def extract_with_gemini(pdf_bytes: bytes, api_key: str) -> Tuple[List[Dict], Dic
         'gemini-flash-latest',
         'gemini-1.5-flash-latest',
     ]
-    
+
     prompt = """Tu es un assistant spécialisé en extraction de données bancaires.
-Analyse ce relevé bancaire PDF et extrais TOUTES les transactions.
+Analyse ce relevé bancaire et extrais TOUTES les transactions.
 
 Retourne UNIQUEMENT un JSON valide (sans markdown, sans backticks) avec cette structure exacte :
 {
@@ -573,25 +584,53 @@ RÈGLES STRICTES :
 - Libellé : nettoyer (pas de date, pas de montant, pas de symboles ¨ þ *)
 - Distinguer débit/crédit selon la POSITION DE LA COLONNE dans le tableau
 """
-    
+
+    # Préparer le contenu à envoyer à Gemini :
+    # - mode normal : le PDF brut (l'IA fait elle-même son OCR si scanné)
+    # - mode images : chaque page convertie en image PNG (contourne les
+    #   structures internes de PDF capricieux)
+    if as_images:
+        try:
+            from pdf2image import convert_from_bytes
+        except ImportError as e:
+            raise RuntimeError(f"pdf2image requis pour le mode image : {e}")
+
+        try:
+            images = convert_from_bytes(pdf_bytes, dpi=200)
+        except Exception as e:
+            raise RuntimeError(f"Conversion PDF→image échouée : {e}")
+
+        # Construire le contenu : prompt + une image par page
+        content = [prompt]
+        for img in images:
+            img_buffer = io.BytesIO()
+            img.save(img_buffer, format='PNG')
+            content.append({
+                'mime_type': 'image/png',
+                'data': img_buffer.getvalue(),
+            })
+    else:
+        # Envoi du PDF brut
+        content = [
+            prompt,
+            {'mime_type': 'application/pdf', 'data': pdf_bytes}
+        ]
+
     last_error = None
     for model_name in MODELS_TO_TRY:
         try:
             model = genai.GenerativeModel(model_name)
-            response = model.generate_content([
-                prompt,
-                {'mime_type': 'application/pdf', 'data': pdf_bytes}
-            ])
-            
+            response = model.generate_content(content)
+
             raw = response.text.strip()
             # Nettoyer markdown éventuel
             if raw.startswith('```'):
                 raw = re.sub(r'^```(?:json)?\s*', '', raw)
                 raw = re.sub(r'\s*```$', '', raw)
-            
+
             data = json.loads(raw)
             transactions = data.get('transactions', [])
-            
+
             # Normaliser les dates
             for t in transactions:
                 if t.get('date'):
@@ -601,19 +640,20 @@ RÈGLES STRICTES :
                 # Nettoyer libellé
                 if t.get('libelle'):
                     t['libelle'] = clean_libelle(t['libelle'])
-            
+
+            method_suffix = ' [mode image]' if as_images else ''
             metadata = {
-                'method': f'Gemini ({model_name})',
+                'method': f'Gemini ({model_name}){method_suffix}',
                 'banque_detectee': data.get('banque'),
                 'model_used': model_name,
             }
-            
+
             return transactions, metadata
-        
+
         except Exception as e:
             last_error = f"{model_name}: {str(e)[:200]}"
             continue
-    
+
     # Tous les modèles ont échoué
     raise RuntimeError(f"Aucun modèle Gemini disponible. Dernière erreur : {last_error}")
 
@@ -724,23 +764,30 @@ def extract_transactions(
 ) -> Tuple[List[Dict], Dict]:
     """
     Extraction en cascade :
-    1. Si force_ai → directement Gemini
-    2. Si force_image → conversion en image + OCR (utile pour PDF natifs "capricieux")
-    3. Sinon : pdfplumber (positions spatiales)
-    4. Si PDF scanné → OCR automatique
-    5. Si toujours rien → Gemini (si clé fournie)
+    1. force_ai + force_image → Gemini avec PDF converti en images
+    2. force_ai seul → Gemini avec PDF brut
+    3. force_image seul → OCR local sur images
+    4. Sinon : pdfplumber (positions spatiales)
+    5. Si PDF scanné → OCR automatique
+    6. Si toujours rien → Gemini (si clé fournie)
     """
+    # Cas 1 : combinaison IA + image → IA reçoit les pages converties en images
+    if force_ai and force_image:
+        if not gemini_api_key:
+            raise RuntimeError("Aucune clé Gemini fournie. Impossible de forcer l'IA.")
+        return extract_with_gemini(pdf_bytes, gemini_api_key, as_images=True)
+
+    # Cas 2 : IA seule → IA reçoit le PDF brut
     if force_ai:
         if not gemini_api_key:
             raise RuntimeError("Aucune clé Gemini fournie. Impossible de forcer l'IA.")
-        return extract_with_gemini(pdf_bytes, gemini_api_key)
+        return extract_with_gemini(pdf_bytes, gemini_api_key, as_images=False)
 
-    # Mode "force image" : on aplatit le PDF en image et on passe par l'OCR,
-    # même si le PDF est natif (contourne les structures internes capricieuses)
+    # Cas 3 : mode image seul (sans IA) → OCR local sur les images
     if force_image:
         ocr_transactions, ocr_metadata = extract_with_ocr(pdf_bytes)
         ocr_metadata['method'] = ocr_metadata.get('method', 'OCR') + ' [mode image forcé]'
-        # Si l'OCR forcé échoue et qu'on a une clé, tenter Gemini
+        # Si l'OCR forcé échoue et qu'on a une clé, tenter Gemini en dernier recours
         if not ocr_transactions and gemini_api_key:
             try:
                 return extract_with_gemini(pdf_bytes, gemini_api_key)

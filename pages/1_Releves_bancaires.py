@@ -118,10 +118,22 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------- Fil d'Ariane ----------
-col_back, _ = st.columns([1, 8])
+col_back, col_reset, _ = st.columns([1, 1, 6])
 with col_back:
     if st.button("← Accueil", key="back_home"):
         st.switch_page("app.py")
+with col_reset:
+    if st.button("🔄 Réinitialiser", key="reset_module_1"):
+        # Effacer toutes les clés de session liées au module 1
+        keys_to_clear = [
+            'transactions', 'metadata', 'solde_info',
+            'compte_banque', 'compte_contrepartie', 'nom_sortie',
+            'verif_result',
+        ]
+        for k in keys_to_clear:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
 
 st.markdown("""
 <p class="breadcrumb">
